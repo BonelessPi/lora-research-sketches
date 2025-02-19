@@ -1,17 +1,15 @@
 /*
- * Adapted from HelTec Automation(TM) WIFI_LoRa_32 factory test code
- *
+  Play hotter colder with HelTec LoRa V3 devices
 */
 
 #include <Arduino.h>
 #include "images.h"
 #include "LoRaWan_APP.h"
 #include "HT_SSD1306Wire.h"
-/********************************* lora  *********************************************/
+
+// LoRa defines
 #define RF_FREQUENCY 915000000 // Hz
-
 #define TX_OUTPUT_POWER 10        // dBm
-
 #define LORA_BANDWIDTH 0          // [0: 125 kHz,
                                   //  1: 250 kHz,
                                   //  2: 500 kHz,
@@ -26,21 +24,21 @@
 #define LORA_FIX_LENGTH_PAYLOAD_ON false
 #define LORA_IQ_INVERSION_ON false
 
-#define USERKEY 0
-#define BUFFER_SIZE 10 // Define the payload size here
+#define USERKEY_PIN 0
 
+#define PACKET_SIZE 10
 #define RX_TIMEOUT_MS 2000
 #define HOLD_THRESHOLD_MS 3000
 #define DEEPSLEEP_TIME_SECS 600
-#define TX_PERIOD_MS 500
+#define TX_PERIOD_MS 100
 #define RSSI_LOWERBOUND -100
 #define RSSI_UPPERBOUND -10
+#define RSSI_BUFFER_SIZE 5
 
 SSD1306Wire factory_display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED); // addr , freq , i2c group , resolution , rst
 
-// Buffers for the sending and receiving of data. rxpacket is currently unused in this PoC
-uint8_t txpacket[BUFFER_SIZE];
-uint8_t rxpacket[BUFFER_SIZE];
+// Buffers for the sending and receiving of data
+uint8_t txpacket[PACKET_SIZE];
 
 static RadioEvents_t RadioEvents;
 
@@ -50,11 +48,11 @@ typedef enum{
   STATE_TX
 }States_t;
 
-States_t state = IDLE;
-String packet;
 uint64_t chipid;
-int16_t latest_rssi = -255;
-long last_pulse = 0;
+States_t state = IDLE;
+long last_pulse_ms = 0;
+int16_t rssi_buffer[RSSI_BUFFER_SIZE];
+int rssi_buffer_idx = 0;
 
 
 void OnTxDone(){
@@ -76,7 +74,9 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
   }
   Serial.println();
 
-  latest_rssi = rssi;
+  rssi_buffer[rssi_buffer_idx] = rssi;
+  rssi_buffer_idx = (rssi_buffer_idx+1) % RSSI_BUFFER_SIZE;
+
   redraw_screen();
   decide_action();
 }
@@ -153,13 +153,13 @@ TaskHandle_t checkUserkey1kHandle = NULL;
 // Function to handle the PRG button in a different task
 void checkUserkey(void *pvParameters){
   uint32_t keydowntime;
-  pinMode(USERKEY,INPUT);
+  pinMode(USERKEY_PIN,INPUT);
   while(1){
-    if(digitalRead(USERKEY) == 0){
+    if(digitalRead(USERKEY_PIN) == 0){
       keydowntime = millis();
       Serial.printf("key down at: %u ms\n",keydowntime);
       delay(10);
-      while(digitalRead(USERKEY) == 0){
+      while(digitalRead(USERKEY_PIN) == 0){
         if((millis()-keydowntime) > HOLD_THRESHOLD_MS){
           break;
         }
@@ -195,15 +195,19 @@ void redraw_screen(){
   factory_display.clear();
   factory_display.setFont(ArialMT_Plain_16);
   factory_display.setTextAlignment(TEXT_ALIGN_CENTER_BOTH);
-  packet = "STATE ";
-  int w;
+  String packet = "STATE ";
+  int w = 0;
   switch(state){
     case IDLE:
       packet += "IDLE";
       break;
     case STATE_RX:
       packet += "RX";
-      w = map(latest_rssi,RSSI_LOWERBOUND,RSSI_UPPERBOUND,1,128);
+      for(int i=0;i<RSSI_BUFFER_SIZE;i++){
+        w += rssi_buffer[i];
+      }
+      w /= RSSI_BUFFER_SIZE;
+      w = map(w,RSSI_LOWERBOUND,RSSI_UPPERBOUND,1,128);
       factory_display.drawRect(0, 32, 128, 32);
       factory_display.fillRect(0, 32, w, 32);
       break;
@@ -232,15 +236,15 @@ void decide_action(){
       Radio.Rx(RX_TIMEOUT_MS);
       break;
     case STATE_TX:
-      d = TX_PERIOD_MS-(millis()-last_pulse);
+      d = TX_PERIOD_MS-(millis()-last_pulse_ms);
       if(d>0){
         delay(d);
       }
-      last_pulse = millis();
+      last_pulse_ms = millis();
       *(uint64_t *)txpacket = chipid;
       *(uint16_t *)(txpacket+8) = i;
       Serial.printf("TX mode, sending i = %02x\n",i++);
-      Radio.Send(txpacket, BUFFER_SIZE);
+      Radio.Send(txpacket, PACKET_SIZE);
       break;
     default:
       break;
