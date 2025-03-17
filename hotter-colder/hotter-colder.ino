@@ -9,7 +9,7 @@
 
 // LoRa defines
 #define RF_FREQUENCY 915000000 // Hz
-#define TX_OUTPUT_POWER 10        // dBm
+#define LOCAL_TX_POWER 10        // dBm
 #define LORA_BANDWIDTH 0          // [0: 125 kHz,
                                   //  1: 250 kHz,
                                   //  2: 500 kHz,
@@ -26,7 +26,9 @@
 
 #define USERKEY_PIN 0
 
-#define PACKET_SIZE 10
+// CRC32c of "hotter-colder" + 0x01, 0x00, 0x00, + xor of prior 7 bytes
+#define PROTOCOL_MAGIC_NUMBER 0x61d16c73010000ae
+#define PACKET_SIZE 64
 #define RX_TIMEOUT_MS 2000
 #define HOLD_THRESHOLD_MS 3000
 #define DEEPSLEEP_TIME_SECS 600
@@ -34,6 +36,7 @@
 #define RSSI_LOWERBOUND -100
 #define RSSI_UPPERBOUND -10
 #define RSSI_BUFFER_SIZE 5
+#define LOCAL_ANTENNA_GAIN 5
 
 SSD1306Wire factory_display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED); // addr , freq , i2c group , resolution , rst
 
@@ -53,7 +56,34 @@ States_t state = IDLE;
 long last_pulse_ms = 0;
 int16_t rssi_buffer[RSSI_BUFFER_SIZE];
 int rssi_buffer_idx = 0;
+int16_t remote_tx_power = LOCAL_TX_POWER;
+int16_t remote_antenna_gain = LOCAL_ANTENNA_GAIN;
 
+float calc_dist(int16_t rssi){
+  return pow(10.0,(-rssi + remote_tx_power + LOCAL_ANTENNA_GAIN + remote_antenna_gain)/20.0) * (299792458.0/4.0/PI/RF_FREQUENCY);
+}
+
+int get_rolling_avg_rssi(){
+  int avg = 0;
+  for(int i=0;i<RSSI_BUFFER_SIZE;i++){
+    avg += rssi_buffer[i];
+  }
+  avg /= RSSI_BUFFER_SIZE;
+  return avg;
+}
+
+void create_and_send_packet(){
+  //memset(txpacket,0,PACKET_SIZE);
+  //RESERVING first 8 bytes for a magic number and second 8 bytes for chipid
+  static uint16_t i = 0;
+  *(uint64_t *)(txpacket+0) = PROTOCOL_MAGIC_NUMBER;
+  *(uint64_t *)(txpacket+8) = chipid;
+  *(int16_t *)(txpacket+16) = LOCAL_TX_POWER;
+  *(int16_t *)(txpacket+18) = LOCAL_ANTENNA_GAIN;
+  *(uint16_t *)(txpacket+20) = i;
+  Serial.printf("TX mode, sending i = %02x\n",i++);
+  Radio.Send(txpacket, PACKET_SIZE);
+}
 
 void OnTxDone(){
   Serial.println("TX done......");
@@ -68,17 +98,20 @@ void OnTxTimeout(){
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
   Serial.println("RX done......");
   Serial.printf("Rx size : %d, rssi : %d, snr : %d\n",size,rssi,snr);
-  for(int i = 0; i < size; i++)
-  {
-    Serial.printf("%02X ",payload[i]);
+  
+  if(size == PACKET_SIZE && *(uint64_t *)payload == PROTOCOL_MAGIC_NUMBER){
+    rssi_buffer[rssi_buffer_idx] = rssi;
+    rssi_buffer_idx = (rssi_buffer_idx+1) % RSSI_BUFFER_SIZE;
+
+    remote_tx_power = *(int16_t *)(payload+16);
+    remote_antenna_gain = *(int16_t *)(payload+18);
+
+    redraw_screen();
+    decide_action();
   }
-  Serial.println();
-
-  rssi_buffer[rssi_buffer_idx] = rssi;
-  rssi_buffer_idx = (rssi_buffer_idx+1) % RSSI_BUFFER_SIZE;
-
-  redraw_screen();
-  decide_action();
+  else{
+    Serial.printf("Bad size or magic number!\n");
+  }
 }
 
 void OnRxTimeout(){
@@ -101,7 +134,7 @@ void lora_init(){
   // Initialize the radio and set the configuration
   Radio.Init(&RadioEvents);
   srand1(Radio.Random());
-  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH,
+  Radio.SetTxConfig(MODEM_LORA, LOCAL_TX_POWER, 0, LORA_BANDWIDTH,
                                  LORA_SPREADING_FACTOR, LORA_CODINGRATE,
                                  LORA_PREAMBLE_LENGTH, LORA_FIX_LENGTH_PAYLOAD_ON,
                                  true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
@@ -157,7 +190,7 @@ void checkUserkey(void *pvParameters){
   while(1){
     if(digitalRead(USERKEY_PIN) == 0){
       keydowntime = millis();
-      Serial.printf("key down at: %u ms\n",keydowntime);
+      Serial.printf("key down at: %lu ms\n",keydowntime);
       delay(10);
       while(digitalRead(USERKEY_PIN) == 0){
         if((millis()-keydowntime) > HOLD_THRESHOLD_MS){
@@ -203,10 +236,8 @@ void redraw_screen(){
       break;
     case STATE_RX:
       packet += "RX";
-      for(int i=0;i<RSSI_BUFFER_SIZE;i++){
-        w += rssi_buffer[i];
-      }
-      w /= RSSI_BUFFER_SIZE;
+      w = get_rolling_avg_rssi();
+	    packet += " " + String(calc_dist(w));
       w = map(w,RSSI_LOWERBOUND,RSSI_UPPERBOUND,1,128);
       factory_display.drawRect(0, 32, 128, 32);
       factory_display.fillRect(0, 32, w, 32);
@@ -224,7 +255,6 @@ void redraw_screen(){
 
 void decide_action(){
   Serial.printf("deciding action, state=%d\n",state);
-  static uint16_t i = 0;
   long d = 0;
   switch(state){
     case IDLE:
@@ -241,10 +271,7 @@ void decide_action(){
         delay(d);
       }
       last_pulse_ms = millis();
-      *(uint64_t *)txpacket = chipid;
-      *(uint16_t *)(txpacket+8) = i;
-      Serial.printf("TX mode, sending i = %02x\n",i++);
-      Radio.Send(txpacket, PACKET_SIZE);
+      create_and_send_packet();
       break;
     default:
       break;
