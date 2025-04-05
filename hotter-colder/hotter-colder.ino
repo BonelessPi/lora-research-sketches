@@ -26,9 +26,9 @@
 
 #define USERKEY_PIN 0
 
-// CRC32c of "hotter-colder" + 0x01, 0x00, 0x00, + xor of prior 7 bytes
-#define PROTOCOL_MAGIC_NUMBER 0x61d16c73010000ae
-#define PACKET_SIZE 64
+// CRC32c of "hotter-colder-v2" = 0x4bb7cfa3
+#define PROTOCOL_MAGIC_NUMBER 0x4bb7cfa3
+#define PACKET_SIZE 32
 #define RX_TIMEOUT_MS 2000
 #define HOLD_THRESHOLD_MS 3000
 #define DEEPSLEEP_TIME_SECS 600
@@ -59,6 +59,18 @@ int rssi_buffer_idx = 0;
 int16_t remote_tx_power = LOCAL_TX_POWER;
 int16_t remote_antenna_gain = LOCAL_ANTENNA_GAIN;
 
+uint64_t get_mac_reversed_byteorder(){
+  uint64_t mac = ESP.getEfuseMac();
+  uint64_t res = 0;
+  for(int i=0; i<6; i++){
+    res <<= 8;
+    res |= mac & 0xff;
+    mac >>= 8;
+  }
+  // res: 2 zero bytes, 3 constant bytes, 3 variable bytes
+  return res;
+}
+
 float calc_dist(int16_t rssi){
   return pow(10.0,(-rssi + remote_tx_power + LOCAL_ANTENNA_GAIN + remote_antenna_gain)/20.0) * (299792458.0/4.0/PI/RF_FREQUENCY);
 }
@@ -74,14 +86,15 @@ int get_rolling_avg_rssi(){
 
 void create_and_send_packet(){
   //memset(txpacket,0,PACKET_SIZE);
-  //RESERVING first 8 bytes for a magic number and second 8 bytes for chipid
+  //RESERVING first 4 bytes for a magic number
   static uint16_t i = 0;
-  *(uint64_t *)(txpacket+0) = PROTOCOL_MAGIC_NUMBER;
-  *(uint64_t *)(txpacket+8) = chipid;
-  *(int16_t *)(txpacket+16) = LOCAL_TX_POWER;
-  *(int16_t *)(txpacket+18) = LOCAL_ANTENNA_GAIN;
-  *(uint16_t *)(txpacket+20) = i;
-  Serial.printf("TX mode, sending i = %02x\n",i++);
+  *(uint32_t *)(txpacket+0) = htonl(PROTOCOL_MAGIC_NUMBER);
+  *(uint32_t *)(txpacket+4) = htonl(chipid >> 32);
+  *(uint32_t *)(txpacket+8) = htonl(chipid & 0xffffffff);
+  *(uint16_t *)(txpacket+12) = htons(LOCAL_TX_POWER);
+  *(uint16_t *)(txpacket+14) = htons(LOCAL_ANTENNA_GAIN);
+  *(uint16_t *)(txpacket+16) = htons(i);
+  Serial.printf("TX mode, sending i = 0x%02x\n",i++);
   Radio.Send(txpacket, PACKET_SIZE);
 }
 
@@ -98,19 +111,29 @@ void OnTxTimeout(){
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
   Serial.println("RX done......");
   Serial.printf("Rx size : %d, rssi : %d, snr : %d\n",size,rssi,snr);
-  
-  if(size == PACKET_SIZE && *(uint64_t *)payload == PROTOCOL_MAGIC_NUMBER){
+
+  // Check if the packet is large enough, has the correct protocol num, and same major version number
+  uint32_t recv_magic_num = ntohl(*(uint32_t *)payload);
+  uint16_t i;
+  if(size >= PACKET_SIZE && recv_magic_num == PROTOCOL_MAGIC_NUMBER){
     rssi_buffer[rssi_buffer_idx] = rssi;
     rssi_buffer_idx = (rssi_buffer_idx+1) % RSSI_BUFFER_SIZE;
 
-    remote_tx_power = *(int16_t *)(payload+16);
-    remote_antenna_gain = *(int16_t *)(payload+18);
+    remote_tx_power = (int16_t)ntohs(*(uint16_t *)(payload+12));
+    remote_antenna_gain = (int16_t)ntohs(*(uint16_t *)(payload+14));
+    i = ntohs(*(uint16_t *)(payload+16));
+    Serial.printf("Recv remote tx power: %d, remote antenna gain: %d, i = 0x%x\n",remote_tx_power,remote_antenna_gain,i);
 
     redraw_screen();
     decide_action();
   }
   else{
-    Serial.printf("Bad size or magic number!\n");
+    Serial.printf("Bad size or protocol magic number/version!\n");
+    Serial.printf("Size: %d bytes",size);
+    if(size >= 8){
+      Serial.printf("; Recvd magic num: 0x%lx, expected: 0x%lx",recv_magic_num,(uint32_t)PROTOCOL_MAGIC_NUMBER);
+    }
+    Serial.println();
   }
 }
 
@@ -281,9 +304,8 @@ void decide_action(){
 void setup(){
   Serial.begin(115200);
   Mcu.begin(HELTEC_BOARD,SLOW_CLK_TPYE);
-  chipid = ESP.getEfuseMac();//The chip ID is essentially its MAC address(length: 6 bytes).
-  Serial.printf("ESP32ChipID=%04X",(uint16_t)(chipid>>32));//print High 2 bytes
-  Serial.printf("%08X\n",(uint32_t)chipid);//print Low 4bytes.
+  chipid = get_mac_reversed_byteorder();
+  Serial.printf("ChipID = 0x%012llX\n",chipid);
   xTaskCreateUniversal(checkUserkey, "checkUserkey1Task", 2048, NULL, 1, &checkUserkey1kHandle, CONFIG_ARDUINO_RUNNING_CORE);
   VextON();
   delay(100);
