@@ -1,5 +1,6 @@
 import argparse
 import numpy as np
+import os.path
 import pandas
 import socket
 import struct
@@ -58,7 +59,7 @@ def handle_client(conn:socket.socket, addr:str, local_eptime:float):
 
         # Create a pandas DataFrame and export to csv
         data = pandas.DataFrame({"time":times,"rssi":rssis})
-        data.to_csv(f"data/{chipid:08X}_{local_eptime:.0f}.csv")
+        data.to_csv(os.path.join(__file__,"..",f"data/{chipid:08X}_{local_eptime:.0f}.csv"))
     except Exception as err:
         print(f"Connection ended with error: {err}")
     finally:

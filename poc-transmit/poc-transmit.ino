@@ -31,8 +31,22 @@ struct __attribute__((packed)) Measurement{
 std::vector<struct Measurement> data;
 uint64_t chipid;
 String cid_str;
+String sketch_md5;
 int prior_wifi_status;
 
+
+bool is_big_endian(void){
+  union {
+    uint32_t i;
+    char c[4];
+  } bint = {0x01020304};
+
+  return bint.c[0] == 1;
+}
+
+bool is_little_endian(void){
+  return !is_big_endian();
+}
 
 uint64_t get_mac_reversed_byteorder(){
   uint64_t mac = ESP.getEfuseMac();
@@ -71,16 +85,26 @@ void generate_data(){
 
 // TODO speed up the sending
 int connect_and_send_data(){
-  int ret = 0;
+  int ret = 0, sockfd;
   struct sockaddr_in serv_addr;
   uint32_t local_mstime;
 
-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  char *ptr = (char *)data.data();
+  size_t i = 0, num_bytes = data.size()*sizeof(struct Measurement);
+  ssize_t bytes_sent;
+
+  if(WiFi.status() != WL_CONNECTED){
+    ret = -1;
+    Serial.println("WiFi not conn!");
+    goto casd_cleanup;
+  }
+
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
   Serial.printf("sockfd = %d\n",sockfd);
   if(sockfd < 0) {
     Serial.println("Socket creation error");
     perror("socket");
-    ret = -1;
+    ret = -2;
     goto casd_cleanup;
   }
 
@@ -88,33 +112,37 @@ int connect_and_send_data(){
   serv_addr.sin_port = htons(DEST_PORT);
   if(inet_pton(AF_INET,DEST_IP,&serv_addr.sin_addr) <= 0) {
     Serial.println("Invalid address/ Address not supported");
-    ret = -1;
+    ret = -3;
     goto casd_cleanup;
   }
   if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
     Serial.println("Connection Failed");
     perror("connect");
-    ret = -1;
+    ret = -4;
     goto casd_cleanup;
   }
+  local_mstime = millis();
   Serial.println("Connected");
   
   uint32_t header[5];
-  local_mstime = millis();
   header[0] = htonl(MAGIC_NUM);
-  header[1] = htonl(chipid >> 32);
+  header[1] = htonl((is_little_endian() << 31) | chipid >> 32);
   header[2] = htonl(chipid & 0xffffffff);
   header[3] = htonl(local_mstime);
   header[4] = htonl(data.size());
   send(sockfd,header,20,0);
 
-  for(struct Measurement m : data){
-    uint32_t ms = htonl(m.ms);
-    uint16_t rssi = htons(m.rssi);
-    send(sockfd,&ms,sizeof(ms),0);
-    send(sockfd,&rssi,sizeof(rssi),0);
+  while(i < num_bytes){
+    bytes_sent = send(sockfd,ptr+i,num_bytes-i,0);
+    if(bytes_sent <= 0){
+      ret = -5;
+      perror("send");
+      goto casd_cleanup;
+    }
+    i += bytes_sent;
   }
-  Serial.println("Sending finished");
+  Serial.printf("Sending finished, took %lu ms\n",millis()-local_mstime);
+  recv(sockfd,NULL,0,0);
 
   casd_cleanup:
   if(sockfd >= 0){
@@ -138,7 +166,7 @@ void VextOFF(){
 // Put the chip into deep sleep (seems to act like a delayed reset?)
 void intodeepsleep(){
   Serial.println("into deep sleep");
-  WiFi.disconnect(true);
+  WiFi.disconnect(true,true);
   VextOFF();
   SPI.end();
   esp_sleep_enable_timer_wakeup(DEEPSLEEP_TIME_SECS*1000*(uint64_t)1000);
@@ -214,24 +242,26 @@ void setup() {
   Mcu.begin(HELTEC_BOARD,SLOW_CLK_TPYE);
   chipid = get_mac_reversed_byteorder();
   cid_str = String(string_format("%012llX",chipid).c_str());
+  sketch_md5 = ESP.getSketchMD5();
   Serial.printf("ChipID = 0x%012llX\n",chipid);
   Serial.printf("Free heap at start: %lu\n",ESP.getFreeHeap());
-  xTaskCreateUniversal(checkUserkey, "checkUserkey1Task", 2048, NULL, 1, &checkUserkey1kHandle, CONFIG_ARDUINO_RUNNING_CORE);
+  xTaskCreateUniversal(checkUserkey, "checkUserkey1Task", 8192, NULL, 1, &checkUserkey1kHandle, CONFIG_ARDUINO_RUNNING_CORE);
   VextON();
   delay(100);
 
   factory_display.init();
   factory_display.setFont(ArialMT_Plain_16);
   factory_display.setTextAlignment(TEXT_ALIGN_CENTER_BOTH);
-  factory_display.drawString(64, 24, ESP.getSketchMD5().substring(0,16));
-  factory_display.drawString(64, 40, ESP.getSketchMD5().substring(16,32));
+  factory_display.drawString(64, 16, sketch_md5.substring(0,11));
+  factory_display.drawString(64, 32, sketch_md5.substring(11,22));
+  factory_display.drawString(64, 48, sketch_md5.substring(22,32));
   factory_display.display();
   
   pinMode(LED, OUTPUT);
-	digitalWrite(LED, LOW);
+  digitalWrite(LED, LOW);
 
   // TODO figure out why sometimes it doesn't reconnect
-  WiFi.disconnect(true);
+  WiFi.disconnect(false,true);
   WiFi.begin(WIFI_SSID,WIFI_PASS);
   WiFi.setAutoReconnect(true);
   prior_wifi_status = -999;
@@ -280,5 +310,5 @@ void loop() {
   }
 
   Mcu.timerhandler();
-  delay(50);
+  delay(100);
 }
