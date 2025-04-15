@@ -12,7 +12,7 @@ import time
 # CRC32 of "transmit-v1"
 MAGIC_NUM = 0x61462cdf
 BYTES_IN_HEADER = 20
-BYTES_PER_FRAME = 4+2
+BYTES_PER_MEASUREMENT = 4+2
 PORT = 55732
 BACKLOG = 15
 SERVER_ACCEPT_TIMEOUT = 5
@@ -36,25 +36,26 @@ def handle_client(conn:socket.socket, addr:str, local_eptime:float):
         buf = conn.recv(BYTES_IN_HEADER-4)
         if len(buf) < BYTES_IN_HEADER-4:
             raise ValueError("Incomplete header")
-        raw_quad,remote_mstime,num_frames = struct.unpack("!QII", buf)
+        raw_quad,remote_mstime,num_measurements = struct.unpack("!QII", buf)
         extra_flags = raw_quad >> 48
         chipid = raw_quad & (2**48-1)
-        print(f"Recvd flags: {extra_flags:016b}, cid: {chipid:012x}, remote_mstime: {remote_mstime}, num_frames: {num_frames}")
+        print(f"Recvd flags: {extra_flags:016b}, cid: {chipid:012x}, remote_mstime: {remote_mstime}, num_measurements: {num_measurements}")
         #TODO VERIFY AND USE THESE NUMS
 
-        # Enter the frames into 2 numpy arrays
-        times = np.zeros(num_frames,dtype=float)
-        rssis = np.zeros(num_frames,dtype=np.int16)
+        # Enter the measurements into 2 numpy arrays
+        times = np.zeros(num_measurements,dtype=float)
+        rssis = np.zeros(num_measurements,dtype=np.int16)
         i = 0
         buf = b""
-        while i < num_frames:
-            if len(buf) < BYTES_PER_FRAME:
+        measurement_unpack_fmtstr = ("<" if extra_flags>>15 else "!")+"Ih"
+        while i < num_measurements:
+            if len(buf) < BYTES_PER_MEASUREMENT:
                 # TODO: test transmission of data (all makes it across / this formula is right)
-                buf += conn.recv(BYTES_PER_FRAME*(num_frames-i)-len(buf))
-            a,b = struct.unpack("!Ih",buf[:BYTES_PER_FRAME])
+                buf += conn.recv(BYTES_PER_MEASUREMENT*(num_measurements-i)-len(buf))
+            a,b = struct.unpack(measurement_unpack_fmtstr,buf[:BYTES_PER_MEASUREMENT])
             times[i] = local_eptime - (remote_mstime - a)/1000
             rssis[i] = b
-            buf = buf[BYTES_PER_FRAME:]
+            buf = buf[BYTES_PER_MEASUREMENT:]
             i += 1
 
         # Create a pandas DataFrame and export to csv

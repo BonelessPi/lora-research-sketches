@@ -17,7 +17,7 @@ Proof of concept for transmitting back to a TCP server
 #define DEEPSLEEP_TIME_SECS 600
 
 #define MAGIC_NUM 0x61462cdf
-#include "secrets.h"
+#include "../secrets.h"
 
 
 SSD1306Wire factory_display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED); // addr , freq , i2c group , resolution , rst
@@ -83,9 +83,8 @@ void generate_data(){
   Serial.printf("Free heap after generate_data: %lu\n",ESP.getFreeHeap());
 }
 
-// TODO speed up the sending
 int connect_and_send_data(){
-  int ret = 0, sockfd;
+  int ret = 0, sockfd = -1;
   struct sockaddr_in serv_addr;
   uint32_t local_mstime;
 
