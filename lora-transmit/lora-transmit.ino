@@ -1,5 +1,7 @@
 /*
-Proof of concept for transmitting back to a TCP server
+This program will:
+* Record the rssi of incoming packets (using the protocol used in hotter-colder sketch)
+* Transmit to computer the recorded data over TCP (same protocol as poc-transmit)
 */
 
 #include <Arduino.h>
