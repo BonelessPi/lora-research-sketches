@@ -1,11 +1,13 @@
 import argparse
-import numpy as np
+from io import BytesIO
 import os.path
-import pandas
 import socket
 import struct
 import threading
 import time
+
+import numpy as np
+import pandas
 
 # TODO: change name of repo and make PoC for arduino devices
 # TODO: add argparse to allow overrides
@@ -40,27 +42,27 @@ def handle_client(conn:socket.socket, addr:str, local_eptime:float):
         extra_flags = raw_quad >> 48
         chipid = raw_quad & (2**48-1)
         print(f"Recvd flags: {extra_flags:016b}, cid: {chipid:012x}, remote_mstime: {remote_mstime}, num_measurements: {num_measurements}")
-        #TODO VERIFY AND USE THESE NUMS
+
+        # Read the entire rest of message
+        buf = BytesIO()
+        while buf.tell() < num_measurements*BYTES_PER_MEASUREMENT:
+            buf.write(conn.recv(BYTES_PER_MEASUREMENT*num_measurements - buf.tell()))
+        conn.close()
+        buf.seek(0)
 
         # Enter the measurements into 2 numpy arrays
+        measurement_unpack_fmtstr = ("<" if extra_flags>>15 else "!")+"Ih"
         times = np.zeros(num_measurements,dtype=float)
         rssis = np.zeros(num_measurements,dtype=np.int16)
-        i = 0
-        buf = b""
-        measurement_unpack_fmtstr = ("<" if extra_flags>>15 else "!")+"Ih"
-        while i < num_measurements:
-            if len(buf) < BYTES_PER_MEASUREMENT:
-                # TODO: test transmission of data (all makes it across / this formula is right)
-                buf += conn.recv(BYTES_PER_MEASUREMENT*(num_measurements-i)-len(buf))
-            a,b = struct.unpack(measurement_unpack_fmtstr,buf[:BYTES_PER_MEASUREMENT])
+        for i in range(num_measurements):
+            a,b = struct.unpack(measurement_unpack_fmtstr,buf.read(BYTES_PER_MEASUREMENT))
             times[i] = local_eptime - (remote_mstime - a)/1000
             rssis[i] = b
-            buf = buf[BYTES_PER_MEASUREMENT:]
-            i += 1
 
         # Create a pandas DataFrame and export to csv
         data = pandas.DataFrame({"time":times,"rssi":rssis})
         data.to_csv(os.path.join(__file__,"..",f"data/{chipid:08X}_{local_eptime:.0f}.csv"))
+        print(f"Transport and export done, took {int((time.time()-local_eptime)*1000)} ms")
     except Exception as err:
         print(f"Connection ended with error: {err}")
     finally:

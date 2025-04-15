@@ -3,11 +3,9 @@ Proof of concept for transmitting back to a TCP server
 */
 
 #include <Arduino.h>
-#include <memory>
 #include <string>
 #include <stdexcept>
 #include <sys/socket.h>
-#include <vector>
 #include <WiFi.h>
 #include "HT_SSD1306Wire.h"
 #include "LoRaWan_APP.h"
@@ -18,6 +16,13 @@ Proof of concept for transmitting back to a TCP server
 
 #define TRANSMIT_PROTOCOL_MAGIC_NUM 0x61462cdf
 #include "../secrets.h"
+#define DESIRED_AUTOSEND_NUMBER 100
+#define MEASUREMENT_BUF_CAPACITY 500
+#define MEASUREMENT_BUF_SLACK 5
+/* The slack is the min number of free spaces between tail and head;
+The slack only has to be long enough so the RxDone callback doesn't begin overwriting memory at
+  the "head" index in transmit_data_home(), like when the socket connect call takes a while.
+*/
 
 // LoRa defines
 #define RF_FREQUENCY 915000000 // Hz
@@ -58,8 +63,13 @@ struct __attribute__((packed)) Measurement{
   int16_t rssi;
 
   Measurement(uint32_t a, int16_t b):ms(a),rssi(b){}
+  Measurement():ms(0),rssi(0){}
 };
-std::vector<struct Measurement> data;
+Measurement measurement_buf[MEASUREMENT_BUF_CAPACITY];
+int measurement_buf_head = 0, measurement_buf_tail = 0;
+int get_num_measurements(){
+  return (MEASUREMENT_BUF_CAPACITY + measurement_buf_tail - measurement_buf_head) % MEASUREMENT_BUF_CAPACITY;
+}
 
 uint64_t chipid;
 String cid_str;
@@ -112,20 +122,36 @@ float calc_dist(int16_t rssi){
   return pow(10.0,(-rssi + remote_tx_power + LOCAL_ANTENNA_GAIN + remote_antenna_gain)/20.0) * (299792458.0/4.0/PI/RF_FREQUENCY);
 }
 
+int _send_all(int sockfd, void *base_ptr, ssize_t num_bytes){
+  ssize_t bytes_sent;
+  char *ptr = (char *)base_ptr;
+  int i = 0;
+
+  while(i < num_bytes){
+    bytes_sent = send(sockfd,ptr+i,num_bytes-i,0);
+    if(bytes_sent <= 0){
+      perror("send");
+      return -1;
+    }
+    i += bytes_sent;
+  }
+
+  return 0;
+}
+
 int transmit_data_home(){
   int ret = 0, sockfd = -1;
   struct sockaddr_in serv_addr;
   uint32_t local_mstime;
+  int head = measurement_buf_head, tail = measurement_buf_tail;
+  ssize_t num_bytes_p1, num_bytes_p2;
 
-  char *ptr = (char *)data.data();
-  size_t i = 0, num_bytes = data.size()*sizeof(struct Measurement);
-  ssize_t bytes_sent;
-
-  if(num_bytes == 0){
+  if(head == tail){
     ret = -6;
     Serial.println("No data to send!");
     goto casd_cleanup;
   }
+
   if(WiFi.status() != WL_CONNECTED){
     ret = -1;
     Serial.println("WiFi not conn!");
@@ -162,18 +188,22 @@ int transmit_data_home(){
   header[1] = htonl((is_little_endian() << 31) | chipid >> 32);
   header[2] = htonl(chipid & 0xffffffff);
   header[3] = htonl(local_mstime);
-  header[4] = htonl(data.size());
-  send(sockfd,header,20,0);
-
-  while(i < num_bytes){
-    bytes_sent = send(sockfd,ptr+i,num_bytes-i,0);
-    if(bytes_sent <= 0){
-      ret = -5;
-      perror("send");
-      goto casd_cleanup;
-    }
-    i += bytes_sent;
+  header[4] = htonl((MEASUREMENT_BUF_CAPACITY + tail - head) % MEASUREMENT_BUF_CAPACITY);
+  if(head <= tail){
+    // No wrap
+    num_bytes_p1 = sizeof(Measurement)*(tail-head);
+    num_bytes_p2 = 0;
   }
+  else{
+    // Wrap
+    num_bytes_p1 = sizeof(Measurement)*(MEASUREMENT_BUF_CAPACITY-head);
+    num_bytes_p2 = sizeof(Measurement)*tail;
+  }
+  Serial.printf("N: %ld, head: %d, tail: %d, nbp1: %d, nbp2: %d\n",ntohl(header[4]),head,tail,num_bytes_p1,num_bytes_p2);
+  _send_all(sockfd,header,20);
+  _send_all(sockfd,measurement_buf+head,num_bytes_p1);
+  _send_all(sockfd,measurement_buf,num_bytes_p2);
+  measurement_buf_head = tail;
   Serial.printf("Sending finished, took %lu ms\n",millis()-local_mstime);
   recv(sockfd,NULL,0,0);
 
@@ -185,8 +215,6 @@ int transmit_data_home(){
 }
 
 void send_lora_pulse(){
-  //memset(txpacket,0,PACKET_SIZE);
-  //RESERVING first 4 bytes for a magic number
   static uint16_t i = 0;
   *(uint32_t *)(lora_txpacket+0) = htonl(LORA_PROTOCOL_MAGIC_NUMBER);
   *(uint32_t *)(lora_txpacket+4) = htonl(chipid >> 32);
@@ -216,9 +244,15 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
   // Check if the packet is large enough, has the correct protocol num, and same major version number
   uint32_t recv_magic_num = ntohl(*(uint32_t *)payload);
   uint16_t i;
-  if(size >= LORA_PACKET_SIZE && recv_magic_num == LORA_PROTOCOL_MAGIC_NUMBER){
-    data.emplace_back(mstime,rssi);
-    Serial.printf("Free heap after lora recv: %lu\n",ESP.getFreeHeap());
+  if(size >= LORA_PACKET_SIZE && recv_magic_num == LORA_PROTOCOL_MAGIC_NUMBER && state == STATE_RX){
+    measurement_buf[measurement_buf_tail] = Measurement(mstime,rssi);
+    if(get_num_measurements() >= MEASUREMENT_BUF_CAPACITY-1-MEASUREMENT_BUF_SLACK){
+      // If circ buf is about to link up, we choose to lose the oldest few values rather than all
+      Serial.println("WARNING: CIRC BUF OUT OF ROOM; BURNING ITEMS!!!");
+      measurement_buf_head = (measurement_buf_head + 1) % MEASUREMENT_BUF_CAPACITY;
+    }
+    measurement_buf_tail = (measurement_buf_tail + 1) % MEASUREMENT_BUF_CAPACITY;
+    Serial.printf("head: %d, tail: %d\n",measurement_buf_head,measurement_buf_tail);
 
     remote_tx_power = (int16_t)ntohs(*(uint16_t *)(payload+12));
     remote_antenna_gain = (int16_t)ntohs(*(uint16_t *)(payload+14));
@@ -226,11 +260,9 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
     Serial.printf("Recv remote tx power: %d, remote antenna gain: %d, i = 0x%x\n",remote_tx_power,remote_antenna_gain,i);
 
     redraw_screen();
-    decide_action();
   }
   else{
-    Serial.printf("Bad size or protocol magic number/version!\n");
-    Serial.printf("Size: %d bytes",size);
+    Serial.printf("Bad state, size, or protocol magic number/version!\nSize: %d bytes",size);
     if(size >= 4){
       Serial.printf("; Recvd magic num: 0x%lx, expected: 0x%lx",recv_magic_num,(uint32_t)LORA_PROTOCOL_MAGIC_NUMBER);
     }
@@ -240,12 +272,10 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr){
 
 void OnRxTimeout(){
   Serial.println("RX Timeout......");
-  decide_action();
 }
 
 void OnRxError(){
   Serial.println("RX Error......");
-  decide_action();
 }
 
 void lora_init(){
@@ -305,18 +335,14 @@ void transition_state(bool long_press){
     case IDLE:
       if(long_press){
         state = STATE_TX;
-        decide_action();
       }
       else{
         state = STATE_RX;
-        decide_action();
       }
       break;
     case STATE_RX:
       state = IDLE;
-      if(transmit_data_home() == 0){
-        data.clear();
-      }
+      transmit_data_home();
       break;
     case STATE_TX:
       state = IDLE;
@@ -325,6 +351,7 @@ void transition_state(bool long_press){
       Serial.printf("Unknown state: %d\n",state);
       state = IDLE;
   }
+  decide_action();
   redraw_screen();
 }
 
@@ -333,7 +360,7 @@ TaskHandle_t checkUserkey1kHandle = NULL;
 void checkUserkey(void *pvParameters){
   uint32_t keydowntime;
   bool long_pressed = false;
-  pinMode(USERKEY_PIN,INPUT);
+  
   while(1){
     if(digitalRead(USERKEY_PIN) == 0){
       keydowntime = millis();
@@ -347,17 +374,16 @@ void checkUserkey(void *pvParameters){
       }
       transition_state(long_pressed);
       while(digitalRead(USERKEY_PIN) == 0){
-        delay(10);
+        delay(5);
       }
     }
+    if(get_num_measurements() >= DESIRED_AUTOSEND_NUMBER){
+      Serial.println("Attempting autosend");
+      transmit_data_home();
+      // This delay is necessary to avoid blocking out the Radio process apparently
+      delay(25);
+    }
   }
-}
-
-void double_output(const char *str){
-  Serial.println(str);
-  factory_display.clear();
-  factory_display.drawString(64,32,str);
-  factory_display.display();
 }
 
 void redraw_screen(){
@@ -372,7 +398,7 @@ void redraw_screen(){
       break;
     case STATE_RX:
       packet += " RX";
-      factory_display.drawString(64,48,"N = "+String(data.size()));
+      factory_display.drawString(64,48,"N = "+String(get_num_measurements()));
       break;
     case STATE_TX:
       packet += " TX";
@@ -416,6 +442,7 @@ void setup() {
   sketch_md5 = ESP.getSketchMD5();
   Serial.printf("ChipID = 0x%012llX\n",chipid);
   Serial.printf("Free heap at start: %lu\n",ESP.getFreeHeap());
+  pinMode(USERKEY_PIN,INPUT);
   xTaskCreateUniversal(checkUserkey, "checkUserkey1Task", 8192, NULL, 1, &checkUserkey1kHandle, CONFIG_ARDUINO_RUNNING_CORE);
   VextON();
   delay(100);
