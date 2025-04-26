@@ -1,4 +1,3 @@
-import argparse
 from io import BytesIO
 import os.path
 import socket
@@ -9,8 +8,6 @@ import time
 import numpy as np
 import pandas
 
-# TODO: change name of repo and make PoC for arduino devices
-# TODO: add argparse to allow overrides
 # CRC32 of "transmit-v1"
 MAGIC_NUM = 0x61462cdf
 BYTES_IN_HEADER = 20
